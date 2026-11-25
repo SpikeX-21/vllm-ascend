@@ -635,7 +635,36 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             if self._session_tracker is not None:
                 self._session_tracker.revoke_put_keys(keys)
 
-    def _handle_range_request(self, req_meta: LayerRangeReqMeta, final_group_layer: bool | None = None) -> None:
+    def _log_first_block_put_results(
+        self,
+        operation: str,
+        layer_id: int,
+        keys: list[str],
+        results: list[int],
+        first_block_requests: dict[str, str] | None,
+    ) -> None:
+        if not first_block_requests:
+            return
+        for key, result in zip(keys, results, strict=True):
+            request_id = first_block_requests.get(key)
+            if request_id is not None:
+                logger.warning(
+                    "[DBG-KVPP-B] %s request=%s block=0 tp_rank=%d layer=%d key=%s result=%s",
+                    operation,
+                    request_id,
+                    self.tp_rank,
+                    layer_id,
+                    key,
+                    result,
+                )
+
+    def _handle_range_request(
+        self,
+        req_meta: LayerRangeReqMeta,
+        final_group_layer: bool | None = None,
+        *,
+        first_block_requests: dict[str, str] | None = None,
+    ) -> None:
         layer_id = req_meta.layer_id
         if self._active_put_keys is None or layer_id == 0:
             self._active_put_keys = set(req_meta.keys)
@@ -664,6 +693,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                     )
                 )
             _emit_range_debug_event("save", layer_id, active_sizes, active_offsets, results)
+            self._log_first_block_put_results("PUT_COPY", layer_id, active_keys, results, first_block_requests)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
@@ -681,6 +711,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             except Exception:
                 self._revoke_range_keys(active_keys)
                 raise
+            self._log_first_block_put_results("PUT_COMMIT", layer_id, active_keys, commit_results, first_block_requests)
             failed_keys = [key for key, result in zip(active_keys, commit_results, strict=True) if result != 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
@@ -692,6 +723,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id
+        log_first_block = self.group_builders is None or len(self.group_builders) == 1
         try:
             for task in transfer_tasks:
                 shared = task.shared_block_data
@@ -702,9 +734,25 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                 if not isinstance(req_meta, LayerRangeReqMeta):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
+                first_block_requests: dict[str, str] = {}
+                if log_first_block:
+                    for block_range in task.block_ranges:
+                        request = block_range.request
+                        if (
+                            block_range.start_block == 0 < block_range.end_block
+                            and request.save_key_block_offset == 0
+                            and request.save_block_keys
+                        ):
+                            key = request.save_block_keys[0]
+                            if key is not None:
+                                first_block_requests.setdefault(key, request.req_id)
                 self._active_put_keys = self._group_put_keys.get(task.group_id)
                 try:
-                    self._handle_range_request(req_meta, task.final_group_layer or layer_id == self.final_layer_id)
+                    self._handle_range_request(
+                        req_meta,
+                        task.final_group_layer or layer_id == self.final_layer_id,
+                        first_block_requests=first_block_requests,
+                    )
                 finally:
                     self._group_put_keys[task.group_id] = self._active_put_keys
                 for req_id in req_meta.req_ids:

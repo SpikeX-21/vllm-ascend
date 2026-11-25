@@ -67,6 +67,22 @@ class BlockKeyDataPlane(LayerwiseDataPlane):
 
     # --- single-group protocol ---------------------------------------------------
 
+    def _log_first_block_put_start(self, request: ReqMeta, key: str | None, result: int | str) -> None:
+        worker = self._worker
+        logger.warning(
+            "[DBG-KVPP-B] PUT_START request=%s block=0 kvpp_rank=%s tp_rank=%s/%s pcp_rank=%s/%s "
+            "use_kvpp=%s key=%s result=%s",
+            request.req_id,
+            getattr(worker, "kvpp_rank", None),
+            worker.tp_rank,
+            getattr(worker, "tp_size", None),
+            worker.pcp_rank,
+            getattr(worker, "pcp_size", None),
+            getattr(worker, "use_kvpp", False),
+            key,
+            result,
+        )
+
     def _prepare_single_group_sessions(self, requests: list[ReqMeta]) -> None:
         worker = self._worker
         worker._layer_load_aborted.clear()
@@ -85,7 +101,10 @@ class BlockKeyDataPlane(LayerwiseDataPlane):
         worker = self._worker
         request.save_block_keys = []
         request.save_last_block_key = None
-        if not worker._is_layerwise_save_owner() or not request.can_save:
+        save_owner = worker._is_layerwise_save_owner()
+        if not save_owner or not request.can_save:
+            if request.save_start_token < worker.block_size <= request.target_token_len and request.block_hashes:
+                self._log_first_block_put_start(request, None, "cannot_save" if save_owner else "not_save_owner")
             return
 
         start_block = request.save_start_token // worker.block_size
@@ -108,6 +127,8 @@ class BlockKeyDataPlane(LayerwiseDataPlane):
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
         if not requested_keys:
             return
+        key, slot, block_index = key_slots[0]
+        first_block_key = key if block_index == 0 and slot is not None else None
         with worker._put_started_keys_lock:
             previously_started = set(requested_keys) & worker._put_started_keys
             new_keys = [key for key in requested_keys if key not in worker._put_started_keys]
@@ -118,20 +139,31 @@ class BlockKeyDataPlane(LayerwiseDataPlane):
             missing_keys = worker._pool_keys_missing(new_keys)
             new_keys = [key for key in new_keys if key in missing_keys]
 
+        first_block_start_index = (
+            new_keys.index(first_block_key) if first_block_key is not None and first_block_key in new_keys else None
+        )
+        first_block_result: int | str = "in_flight" if first_block_key in previously_started else "not_submitted"
         started = set(previously_started)
         if new_keys:
             try:
                 results = worker._start_layerwise_put_keys(new_keys, worker._layerwise_object_size_bytes())
             except Exception as exc:
+                if first_block_start_index is not None:
+                    first_block_result = type(exc).__name__
                 logger.error("Layerwise batch_put_start failed keys=%s error=%s", new_keys, exc)
                 with worker._put_started_keys_lock:
                     worker._put_started_keys.update(new_keys)
                 worker._queue_layerwise_revoke_keys(new_keys)
             else:
                 newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
+                if first_block_start_index is not None:
+                    first_block_result = results[first_block_start_index]
                 with worker._put_started_keys_lock:
                     worker._put_started_keys.update(newly_started)
                 started.update(newly_started)
+
+        if first_block_key is not None:
+            self._log_first_block_put_start(request, first_block_key, first_block_result)
 
         for key, slot, _ in key_slots:
             if key in started:

@@ -195,6 +195,8 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         token_len: int,
         group_block_sizes: Sequence[int],
         skip_tokens: int,
+        *,
+        log_first_block: bool = False,
     ) -> list[tuple[int, int, int]]:
         """Contiguous hit scan shared by both layerwise data planes.
 
@@ -227,7 +229,9 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             ]
             if not keys_by_block:
                 continue
-            block_hits = self._query_layerwise_block_hits(keys_by_block)
+            block_hits = self._query_layerwise_block_hits(
+                keys_by_block, first_block_request_id=request.request_id if log_first_block else None
+            )
             num_hit_blocks = 0
             for hit in block_hits:
                 if hit:
@@ -288,7 +292,7 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         # keeps no per-group local-prefix state: scan the first group only,
         # with nothing to skip.
         del num_computed_tokens
-        results = self._query_contiguous_group_hits(request, token_len, [self._block_size], 0)
+        results = self._query_contiguous_group_hits(request, token_len, [self._block_size], 0, log_first_block=True)
         if not results:
             return 0
         hit_tokens, num_hit_blocks, num_probed_blocks = results[0]
@@ -324,7 +328,9 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             keys.extend(draft_keys.make_hit_check_keys(block_hash_hex))
         return keys
 
-    def _query_layerwise_block_hits(self, keys_by_block: list[list[str]]) -> list[bool]:
+    def _query_layerwise_block_hits(
+        self, keys_by_block: list[list[str]], *, first_block_request_id: str | None = None
+    ) -> list[bool]:
         """Probe backend readability and fold physical keys into block hits."""
         all_keys = [key for block_keys in keys_by_block for key in block_keys]
         if not all_keys:
@@ -343,6 +349,18 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             if len(batch_readable) != len(batch) or any(type(state) is not bool for state in batch_readable):
                 raise RuntimeError("Layerwise readability probe returned invalid results")
             readable.extend(batch_readable)
+
+        if first_block_request_id is not None:
+            first_block_keys = keys_by_block[0]
+            logger.warning(
+                "[DBG-KVPP-B] LOOKUP request=%s block=0 kvpp_size=%s tp_size=%s pcp_size=%s put_step=%s readable=%s",
+                first_block_request_id,
+                self.kvpp_size,
+                self.tp_size,
+                self.pcp_size,
+                self.put_step,
+                list(zip(first_block_keys, readable[: len(first_block_keys)], strict=True)),
+            )
 
         block_hits = []
         offset = 0
